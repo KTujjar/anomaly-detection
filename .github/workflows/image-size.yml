@@ -13,6 +13,8 @@ jobs:
   measure:
     name: Measure before/after
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,16 +79,30 @@ jobs:
             || { docker logs after-api; exit 1; }
           docker rm -f after-api
 
+      # Step summaries and job logs both require auth to read back, so the
+      # numbers also go out as a commit comment, which is publicly readable.
       - name: Report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' > report.md
           import os
           b, a = int(os.environ["BEFORE_BYTES"]), int(os.environ["AFTER_BYTES"])
           bs, as_ = int(os.environ["BEFORE_SECONDS"]), int(os.environ["AFTER_SECONDS"])
           gb = lambda n: f"{n / 1e9:.2f} GB"
+          print("### Serving image A/B (cold cache, same runner)")
+          print()
           print("| | before | after | delta |")
           print("|---|---|---|---|")
           print(f"| image size | {gb(b)} | {gb(a)} | -{gb(b - a)} ({(b - a) / b:.0%}) |")
           print(f"| build time | {bs}s | {as_}s | -{bs - as_}s |")
+          print()
+          print(f"raw bytes: before={b} after={a}")
           PY
-          cat "$GITHUB_STEP_SUMMARY"
+          cat report.md | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -c "import json; print(json.dumps({'body': open('report.md').read()}))" > body.json
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -d @body.json > /dev/null
