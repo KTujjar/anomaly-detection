@@ -1,0 +1,27 @@
+# Runtime dependencies for the serving image only.
+#
+# Everything here is imported by src/serving, src/models, or src/ingestion.
+# Notebook and analysis packages (jupyter, matplotlib, seaborn) and test
+# packages (pytest, httpx) live in requirements.txt and are deliberately
+# excluded — they are never imported at runtime.
+#
+# torch is installed separately in the Dockerfile from the CPU wheel index;
+# the pin here is what pip checks it against.
+
+# ML runtime
+torch>=2.2.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+scikit-learn>=1.4.0
+
+# API
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+
+# Kafka consumer (imported lazily by src/ingestion/kafka_consumer.py)
+kafka-python>=2.0.2
+
+# Model (de)serialization
+joblib>=1.4.0

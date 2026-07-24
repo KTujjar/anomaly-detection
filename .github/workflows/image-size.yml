@@ -1,0 +1,92 @@
+# TEMPORARY measurement workflow — delete before merging to master.
+# Builds master's Dockerfile and this branch's Dockerfile on the same runner,
+# cold cache, and reports image size + build duration for each.
+
+name: Image size A/B
+
+on:
+  push:
+    branches: [perf/slim-image]
+  workflow_dispatch:
+
+jobs:
+  measure:
+    name: Measure before/after
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # The Dockerfile COPYs artifacts/, which is gitignored — both builds need
+      # models present or they fail on a clean checkout.
+      - name: Produce artifacts
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          python data/generate_data.py --rows 5000
+          python src/training/train.py --dataset univariate --epochs 2
+
+      - name: Show disk before
+        run: df -h /
+
+      - name: Build BEFORE image (master's Dockerfile)
+        run: |
+          git show origin/master:Dockerfile > Dockerfile.before
+          echo "--- Dockerfile.before install line ---"
+          grep -n "pip install" Dockerfile.before
+          start=$(date +%s)
+          docker build --no-cache -f Dockerfile.before -t anomaly:before .
+          end=$(date +%s)
+          echo "BEFORE_SECONDS=$((end - start))" >> "$GITHUB_ENV"
+          echo "BEFORE_BYTES=$(docker image inspect anomaly:before --format '{{.Size}}')" >> "$GITHUB_ENV"
+
+      - name: Reclaim disk
+        run: |
+          docker image rm anomaly:before
+          docker builder prune -af
+          df -h /
+
+      - name: Build AFTER image (this branch)
+        run: |
+          start=$(date +%s)
+          docker build --no-cache -t anomaly:after .
+          end=$(date +%s)
+          echo "AFTER_SECONDS=$((end - start))" >> "$GITHUB_ENV"
+          echo "AFTER_BYTES=$(docker image inspect anomaly:after --format '{{.Size}}')" >> "$GITHUB_ENV"
+
+      # The whole point of the slim image is that it still serves. If /ready is
+      # 503 the size win is worthless, so fail here rather than report a number.
+      - name: Smoke test AFTER image
+        run: |
+          docker run -d --name after-api -p 8080:8080 \
+            -e ARTIFACT_DIR=/app/artifacts -e DATASET=univariate anomaly:after
+          for i in $(seq 1 30); do
+            curl -sf localhost:8080/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf localhost:8080/health || { docker logs after-api; exit 1; }
+          curl -sf localhost:8080/ready  || { docker logs after-api; exit 1; }
+          python3 -c "import json; print(json.dumps({'windows': [[i/50 for i in range(50)]], 'n_features': 1, 'model': 'both'}))" > payload.json
+          curl -sf -X POST localhost:8080/predict -H 'content-type: application/json' -d @payload.json \
+            || { docker logs after-api; exit 1; }
+          docker rm -f after-api
+
+      - name: Report
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          b, a = int(os.environ["BEFORE_BYTES"]), int(os.environ["AFTER_BYTES"])
+          bs, as_ = int(os.environ["BEFORE_SECONDS"]), int(os.environ["AFTER_SECONDS"])
+          gb = lambda n: f"{n / 1e9:.2f} GB"
+          print("| | before | after | delta |")
+          print("|---|---|---|---|")
+          print(f"| image size | {gb(b)} | {gb(a)} | -{gb(b - a)} ({(b - a) / b:.0%}) |")
+          print(f"| build time | {bs}s | {as_}s | -{bs - as_}s |")
+          PY
+          cat "$GITHUB_STEP_SUMMARY"
