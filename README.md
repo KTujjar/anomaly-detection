@@ -1,5 +1,7 @@
 # Real-Time Anomaly Detection Platform
 
+[![CI](https://github.com/KTujjar/Project_1/actions/workflows/ci.yml/badge.svg)](https://github.com/KTujjar/Project_1/actions/workflows/ci.yml)
+
 A production-grade streaming anomaly detection service that compares a classical statistical detector (EWMA + 3-sigma) against a PyTorch LSTM Autoencoder, deployed as a containerized API on Kubernetes.
 
 ## Architecture

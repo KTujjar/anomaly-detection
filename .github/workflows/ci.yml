@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Train + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the default wheel pulls ~2GB of CUDA libraries the runner can't use
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      # artifacts/ is gitignored, so a fresh checkout has no models. Regenerate a
+      # small set here: it keeps the API tests from skipping and gives the image
+      # something to bake in.
+      - name: Generate sample data
+        run: python data/generate_data.py --rows 5000
+
+      - name: Train models
+        run: python src/training/train.py --dataset univariate --epochs 2
+
+      - name: Run tests
+        run: pytest -q -rs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts/
+          retention-days: 7
+
+  docker:
+    name: Build + smoke test image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts/
+
+      - name: Compute image name
+        # GHCR rejects uppercase, and the repo is KTujjar/Project_1
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the container
+        run: |
+          docker run -d --name anomaly-api -p 8080:8080 \
+            -e ARTIFACT_DIR=/app/artifacts -e DATASET=univariate \
+            "$IMAGE:${{ github.sha }}"
+
+          for i in $(seq 1 30); do
+            curl -sf localhost:8080/health >/dev/null && break
+            sleep 2
+          done
+
+          echo "--- /health ---"; curl -sf localhost:8080/health || { docker logs anomaly-api; exit 1; }
+          # /ready is 503 unless the models actually loaded — this is what proves
+          # the artifacts made it into the image.
+          echo "--- /ready ---";  curl -sf localhost:8080/ready  || { docker logs anomaly-api; exit 1; }
+
+          python3 -c "import json; print(json.dumps({'windows': [[i/50 for i in range(50)]], 'n_features': 1, 'model': 'both'}))" > payload.json
+          echo "--- /predict ---"
+          curl -sf -X POST localhost:8080/predict -H 'content-type: application/json' -d @payload.json \
+            || { docker logs anomaly-api; exit 1; }
+
+          docker rm -f anomaly-api
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
