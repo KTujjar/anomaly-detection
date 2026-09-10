@@ -16,6 +16,7 @@ in-memory buffer owned by a StreamingDetector, so the Cloud Run service handling
 push delivery runs pinned to a single instance. See src/ingestion/pipeline.py.
 """
 
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -36,6 +37,14 @@ from src.serving import pubsub
 
 ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "artifacts")
 DATASET = os.environ.get("DATASET", "univariate")
+
+# Without this the root logger sits at WARNING, and every detection the push
+# endpoint reports at INFO is silently dropped -- which on Cloud Run means
+# `gcloud run services logs read` shows the errors and none of the results.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(levelname)s %(name)s %(message)s",
+)
 
 _state: dict = {
     "ewma": None,
