@@ -2,15 +2,21 @@
 FastAPI inference service.
 
 Endpoints:
-  POST /predict  — run one or both detectors on a batch of windows
-  GET  /health   — liveness probe (always 200 if process is alive)
-  GET  /ready    — readiness probe (200 only if models are loaded)
-  GET  /metrics  — Prometheus-style plain-text counters
+  POST /predict      — run one or both detectors on a batch of windows
+  GET  /health       — liveness probe (always 200 if process is alive)
+  GET  /ready        — readiness probe (200 only if models are loaded)
+  GET  /metrics      — Prometheus-style plain-text counters
+  POST /pubsub/push  — Pub/Sub push delivery, mounted from src/serving/pubsub.py
 
 Startup loads both the EWMA detector and LSTM Autoencoder from artifacts/.
-The service is stateless — model weights are baked in at image build time.
+
+/predict is stateless — model weights are baked in at image build time, and each
+request carries its own complete windows. /pubsub/push is NOT: it feeds a rolling
+in-memory buffer owned by a StreamingDetector, so the Cloud Run service handling
+push delivery runs pinned to a single instance. See src/ingestion/pipeline.py.
 """
 
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -23,12 +29,22 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from src.ingestion.features import Normalizer
+from src.ingestion.pipeline import StreamingDetector
 from src.models.lstm_autoencoder import AnomalyDetector as LSTMDetector
 from src.models.statistical import EWMADetector
+from src.serving import pubsub
 
 
 ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "artifacts")
 DATASET = os.environ.get("DATASET", "univariate")
+
+# Without this the root logger sits at WARNING, and every detection the push
+# endpoint reports at INFO is silently dropped -- which on Cloud Run means
+# `gcloud run services logs read` shows the errors and none of the results.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(levelname)s %(name)s %(message)s",
+)
 
 _state: dict = {
     "ewma": None,
@@ -51,11 +67,17 @@ async def lifespan(app: FastAPI):
     missing = [p for p in [ewma_path, lstm_path, scaler_path] if not os.path.exists(p)]
     if missing:
         print(f"WARNING: artifact(s) not found: {missing}. /ready will return 503.")
+        app.state.streaming_detector = None
     else:
         _state["ewma"] = EWMADetector.load(ewma_path)
         _state["lstm"] = LSTMDetector.load(lstm_path)
         _state["normalizer"] = Normalizer.load(scaler_path)
         _state["ready"] = True
+        # Same artifacts, second consumer: the push endpoint needs a detector that
+        # owns a rolling buffer, which /predict does not.
+        app.state.streaming_detector = StreamingDetector(
+            dataset=DATASET, artifact_dir=ARTIFACT_DIR
+        )
         print(f"Models loaded from {ARTIFACT_DIR}/ (dataset={DATASET})")
 
     yield
@@ -67,6 +89,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(pubsub.router)
 
 
 # ------------------------------------------------------------------

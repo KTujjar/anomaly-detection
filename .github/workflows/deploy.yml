@@ -1,0 +1,207 @@
+name: Deploy
+
+# Deploys the serving image to Cloud Run and applies terraform/.
+#
+# ci.yml is left alone on purpose: it gates every branch and PR, while this runs
+# only for master and for changes to infrastructure. Different jobs, different
+# triggers.
+#
+# SETUP -- fill these in once, from `terraform -chdir=terraform/bootstrap output`:
+#   GCP_PROJECT_ID              vars, e.g. anomaly-detection-prod
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  vars, the full projects/.../providers/... path
+#   GCP_DEPLOYER_SA             vars, gha-deployer@<project>.iam.gserviceaccount.com
+#   TF_STATE_BUCKET             vars, <project>-tfstate
+#
+# Repository VARIABLES, not secrets. Workload Identity Federation has no key
+# material -- access is gated by the attribute condition pinning the pool to this
+# repository, so these strings are useless to anyone else.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  # Never let two applies race for the same state lock.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGION: us-central1
+  IMAGE_NAME: anomaly-api
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PRs touching terraform/ get a plan posted as a comment. Nothing is applied.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required to mint the GitHub OIDC token for WIF
+      pull-requests: write   # required to post the plan comment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Format check
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Init
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Validate
+        run: terraform -chdir=terraform validate
+
+      - name: Plan
+        id: plan
+        # The plan runs against whatever image is currently deployed, since this
+        # PR has not built one. Infrastructure changes are what is under review.
+        run: |
+          terraform -chdir=terraform plan -input=false -no-color \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${REGION}" \
+            > plan.txt 2>&1 || { cat plan.txt; exit 1; }
+          # Keep the comment under GitHub's 65536-char body limit
+          tail -c 60000 plan.txt > plan_trimmed.txt
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan_trimmed.txt', 'utf8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Terraform plan\n\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n\n</details>`
+            });
+
+  # ---------------------------------------------------------------------------
+  # master: train, build, push, apply, then prove the live service works.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Build and deploy
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the default wheel pulls ~2GB of CUDA libraries the
+          # runner cannot use.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      # artifacts/ is gitignored, so a fresh checkout has no models. They have to
+      # exist BEFORE the image build, because the Dockerfile bakes them in and
+      # /ready stays 503 without them.
+      - name: Generate sample data
+        run: python data/generate_data.py --rows 5000
+
+      - name: Train models
+        run: python src/training/train.py --dataset univariate --epochs 2
+
+      - name: Run tests
+        run: pytest -q -rs
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Init
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      # Artifact Registry has to exist before an image can be pushed to it, but
+      # the Cloud Run services cannot start without the image. Create the registry
+      # first, then push, then apply the rest.
+      - name: Create the registry
+        run: |
+          terraform -chdir=terraform apply -input=false -auto-approve \
+            -target=google_project_service.required \
+            -target=google_artifact_registry_repository.anomaly \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${REGION}"
+
+      - name: Build and push image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/anomaly/${IMAGE_NAME}"
+          docker build -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
+
+      - name: Apply
+        # image_tag is an input, so infrastructure and release move together --
+        # Terraform performs the rollout rather than a separate gcloud deploy.
+        run: |
+          terraform -chdir=terraform apply -input=false -auto-approve \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=${REGION}" \
+            -var="image_tag=${GITHUB_SHA}"
+
+      - name: Smoke test the live service
+        run: |
+          API_URL="$(terraform -chdir=terraform output -raw api_url)"
+          echo "Deployed to $API_URL"
+
+          # Cold start pulls the image and loads model artifacts; give it room.
+          for i in $(seq 1 30); do
+            curl -sf "$API_URL/health" >/dev/null && break
+            sleep 5
+          done
+
+          echo "--- /health ---"
+          curl -sf "$API_URL/health" || { echo "health failed"; exit 1; }
+
+          # /ready is 503 unless the models actually loaded. This is what proves
+          # the artifacts made it into the image, same assertion ci.yml makes.
+          echo "--- /ready ---"
+          curl -sf "$API_URL/ready" || { echo "ready failed — artifacts missing?"; exit 1; }
+
+          python3 -c "import json; print(json.dumps({'windows': [[i/50 for i in range(50)]], 'n_features': 1, 'model': 'both'}))" > payload.json
+          echo "--- /predict ---"
+          curl -sf -X POST "$API_URL/predict" \
+            -H 'content-type: application/json' \
+            -d @payload.json || { echo "predict failed"; exit 1; }
+
+          echo ""
+          echo "::notice title=Deployed::$API_URL"

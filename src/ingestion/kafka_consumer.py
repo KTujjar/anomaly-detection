@@ -1,9 +1,14 @@
 """
 Kafka consumer that feeds live time-series data through both detectors.
 
-Reads JSON messages from a Kafka topic, builds sliding windows using Pandas,
-and runs both the EWMA and LSTM detectors. Anomaly flags are printed and can
-be forwarded to any downstream sink (alerting, database, another topic).
+Reads JSON messages from a Kafka topic and hands each row to the shared
+StreamingDetector in src/ingestion/pipeline.py, which owns the rolling window and
+both models. Anomaly flags are printed and can be forwarded to any downstream sink
+(alerting, database, another topic).
+
+This is the local development path -- `docker-compose up` brings up Kafka alongside
+the API. The deployed path on Cloud Run uses Pub/Sub push instead; both run the same
+detection code.
 
 Message format expected on the topic:
     {"timestamp": "2024-01-01T00:00:00", "value": 1.23}          # univariate
@@ -20,36 +25,23 @@ import argparse
 import json
 import os
 import sys
-import time
-from collections import deque
-
-import numpy as np
-import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from src.ingestion.features import Normalizer, sliding_windows
-from src.models.lstm_autoencoder import AnomalyDetector as LSTMDetector
-from src.models.statistical import EWMADetector
-
-ARTIFACT_DIR = "artifacts"
-WINDOW_SIZE = 50
-
-
-def load_artifacts(dataset: str):
-    ewma = EWMADetector.load(os.path.join(ARTIFACT_DIR, f"{dataset}_ewma.pkl"))
-    lstm = LSTMDetector.load(os.path.join(ARTIFACT_DIR, f"{dataset}_lstm.pt"))
-    normalizer = Normalizer.load(os.path.join(ARTIFACT_DIR, f"{dataset}_scaler.pkl"))
-    return ewma, lstm, normalizer
+from src.ingestion.pipeline import (  # noqa: E402
+    ARTIFACT_DIR,
+    MissingFieldsError,
+    StreamingDetector,
+    format_result,
+)
 
 
 def run_consumer(topic: str, bootstrap_servers: str, dataset: str) -> None:
     from kafka import KafkaConsumer
 
     print(f"Loading artifacts for dataset='{dataset}'...")
-    ewma, lstm, normalizer = load_artifacts(dataset)
-    feature_cols = ewma.feature_cols
-    print(f"  Features: {feature_cols}")
+    detector = StreamingDetector(dataset=dataset, artifact_dir=ARTIFACT_DIR)
+    print(f"  Features: {detector.feature_cols}")
     print(f"  Connecting to Kafka at {bootstrap_servers}, topic='{topic}'")
 
     consumer = KafkaConsumer(
@@ -61,47 +53,20 @@ def run_consumer(topic: str, bootstrap_servers: str, dataset: str) -> None:
         group_id="anomaly-detector",
     )
 
-    # Rolling buffer — keeps the last WINDOW_SIZE rows for windowed inference
-    buffer: deque = deque(maxlen=WINDOW_SIZE)
-
     print(f"Listening on topic '{topic}'... (Ctrl-C to stop)\n")
 
     for message in consumer:
         row = message.value
-        timestamp = row.get("timestamp", "unknown")
-
-        # Extract feature values in the expected order
-        values = {col: row.get(col) for col in feature_cols}
-        if any(v is None for v in values.values()):
-            print(f"[SKIP] Missing fields in message: {row}")
+        try:
+            result = detector.handle(row)
+        except MissingFieldsError as exc:
+            print(f"[SKIP] {exc} in message: {row}")
             continue
 
-        buffer.append(values)
+        if result is None:
+            continue  # not enough data yet to fill a window
 
-        if len(buffer) < WINDOW_SIZE:
-            continue   # not enough data yet to fill a window
-
-        # Build a DataFrame from the rolling buffer
-        df = pd.DataFrame(list(buffer))
-        df_norm = normalizer.transform(df)
-
-        # EWMA: score the most recent point
-        _, ewma_flags = ewma.predict(df_norm)
-        ewma_anomaly = bool(ewma_flags[-1])
-        ewma_score = ewma.anomaly_score(df_norm)[-1]
-
-        # LSTM: score the whole window
-        windows, _ = sliding_windows(df_norm, feature_cols, window_size=WINDOW_SIZE, step=WINDOW_SIZE)
-        lstm_scores, lstm_flags = lstm.predict(windows)
-        lstm_anomaly = bool(lstm_flags[0])
-        lstm_score = float(lstm_scores[0])
-
-        status = "ANOMALY" if (ewma_anomaly or lstm_anomaly) else "normal"
-        print(
-            f"[{timestamp}]  {status:8s}  "
-            f"ewma={ewma_score:.4f}({'!' if ewma_anomaly else ' '})  "
-            f"lstm={lstm_score:.6f}({'!' if lstm_anomaly else ' '})"
-        )
+        print(format_result(result))
 
 
 def main() -> None:
