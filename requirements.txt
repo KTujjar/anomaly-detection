@@ -13,6 +13,11 @@ pydantic>=2.7.0
 # Kafka
 kafka-python>=2.0.2
 
+# Pub/Sub publisher (scripts/publish_sample.py only -- deliberately NOT in
+# requirements-serving.txt: push delivery is a plain HTTP POST, so the serving
+# image never needs the client library)
+google-cloud-pubsub>=2.21.0
+
 # Notebooks
 jupyter>=1.0.0
 matplotlib>=3.9.0
